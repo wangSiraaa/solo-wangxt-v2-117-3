@@ -104,14 +104,18 @@ function httpGet(p, token) {
 }
 
 function httpPost(p, token, body) {
+  return httpReq('POST', p, token, body);
+}
+
+function httpReq(method, p, token, body) {
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body || {});
+    const data = body === undefined ? null : JSON.stringify(body);
     const req = http.request(`${BASE}${p}`, {
-      method: 'POST',
+      method,
       headers: {
-        'content-type': 'application/json',
-        'x-auth-token': token,
-        'content-length': Buffer.byteLength(data),
+        ...(data ? { 'content-type': 'application/json',
+          'content-length': Buffer.byteLength(data) } : {}),
+        ...(token ? { 'x-auth-token': token } : {}),
       },
     }, (res) => {
       let b = '';
@@ -119,7 +123,7 @@ function httpPost(p, token, body) {
       res.on('end', () => resolve({ status: res.statusCode, body: b }));
     });
     req.on('error', reject);
-    req.write(data);
+    if (data) req.write(data);
     req.end();
   });
 }
@@ -690,13 +694,114 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 owner member management at runtime: invite / role change / revoke
+// ---------------------------------------------------------------------------
+const t11 = test('T11 owner manages members at runtime; per-update authz follows role changes', async () => {
+  await createDoc('t11', { owners: ['user-owner'], writers: ['user-alice'] });
+
+  // --- negative: non-owner and cross-tenant callers cannot change records ---
+  const before = (await db.query(
+    `SELECT user_id, role, revoked_at FROM document_members
+      WHERE doc_id='t11' ORDER BY user_id`)).rows;
+
+  const w = await httpPost('/v1/docs/t11/members', 'user-alice',
+    { userId: 'user-erin', role: 'writer' });
+  assert.equal(w.status, 403, 'writer must not invite');
+  const x = await httpPost('/v1/docs/t11/members', 'user-dave',
+    { userId: 'user-erin', role: 'writer' });
+  assert.equal(x.status, 403, 'cross-tenant user must not invite');
+  const xList = await httpGet('/v1/docs/t11/members', 'user-dave');
+  assert.equal(JSON.parse(xList).error, 'FORBIDDEN');
+  const xPatch = await httpReq('PATCH', '/v1/docs/t11/members/user-alice', 'user-dave',
+    { role: 'reader' });
+  assert.equal(xPatch.status, 403);
+  const xDel = await httpReq('DELETE', '/v1/docs/t11/members/user-alice', 'user-dave');
+  assert.equal(xDel.status, 403);
+
+  const after = (await db.query(
+    `SELECT user_id, role, revoked_at FROM document_members
+      WHERE doc_id='t11' ORDER BY user_id`)).rows;
+  assert.deepEqual(after, before, 'member records unchanged by forbidden calls');
+
+  // --- invite: owner adds erin (same tenant) as writer ---
+  const inv = await httpPost('/v1/docs/t11/members', 'user-owner',
+    { userId: 'user-erin', role: 'writer' });
+  assert.equal(inv.status, 201, `invite -> 201, got ${inv.status}: ${inv.body}`);
+  const invBody = JSON.parse(inv.body);
+  assert.equal(invBody.member.changedBy, 'user-owner');
+  assert.ok(invBody.member.changedAt, 'changed_at recorded');
+
+  // cross-tenant invite target refused
+  const badTenant = await httpPost('/v1/docs/t11/members', 'user-owner',
+    { userId: 'user-dave', role: 'writer' });
+  assert.equal(badTenant.status, 403);
+  assert.equal(JSON.parse(badTenant.body).error, 'TENANT_MISMATCH');
+
+  // erin collaborates as writer
+  const erin = new DocClient({ url: WS_URL, token: 'user-erin', docId: 't11' });
+  await erin.connect();
+  assert.equal(erin.role, 'writer');
+  erin.localEdit((t) => t.insert(0, 'erin-was-writer '));
+  await erin.flush();
+
+  // --- role change writer -> reader: old connection's next write rejected ---
+  const dem = await httpReq('PATCH', '/v1/docs/t11/members/user-erin', 'user-owner',
+    { role: 'reader' });
+  assert.equal(dem.status, 200);
+  assert.equal(JSON.parse(dem.body).member.role, 'reader');
+
+  const u1 = erin.localEdit((t) => t.insert(t.length, 'erin-as-reader'));
+  await assert.rejects(erin.sendUpdate(u1, 3000), /READ_ONLY/);
+
+  // reader can still sync (read path unaffected)
+  const sv = Y.encodeStateVector(erin.doc);
+  const diff = await erin.requestSync(sv);
+  assert.ok(diff.type === 'sync-diff');
+
+  // --- revoke: old connection write AND reconnect both refused ---
+  const rev = await httpReq('DELETE', '/v1/docs/t11/members/user-erin', 'user-owner');
+  assert.equal(rev.status, 200);
+  assert.equal(JSON.parse(rev.body).member.revoked, true);
+
+  const u2 = erin.localEdit((t) => t.insert(t.length, 'erin-after-revoke'));
+  await assert.rejects(erin.sendUpdate(u2, 3000), /FORBIDDEN/);
+
+  const erin2 = new DocClient({ url: WS_URL, token: 'user-erin', docId: 't11' });
+  await assert.rejects(erin2.connect(), /FORBIDDEN/);
+
+  // rejected edits never persisted
+  const rec = await rebuildAndHash('t11');
+  assert.equal(rec.text, 'erin-was-writer ');
+
+  // --- list shows current role + revoked state + operator ---
+  const list = JSON.parse(await httpGet('/v1/docs/t11/members', 'user-owner'));
+  const erinRow = list.members.find((m) => m.userId === 'user-erin');
+  assert.equal(erinRow.role, 'reader', 'list shows last assigned role');
+  assert.equal(erinRow.revoked, true, 'list shows revoked state');
+  assert.equal(erinRow.changedBy, 'user-owner');
+  assert.ok(erinRow.changedAt);
+  const aliceRow = list.members.find((m) => m.userId === 'user-alice');
+  assert.equal(aliceRow.role, 'writer');
+  assert.equal(aliceRow.revoked, false);
+
+  // owner row is protected from management operations
+  const lockPatch = await httpReq('PATCH', '/v1/docs/t11/members/user-owner', 'user-owner',
+    { role: 'writer' });
+  assert.equal(lockPatch.status, 409);
+  const lockDel = await httpReq('DELETE', '/v1/docs/t11/members/user-owner', 'user-owner');
+  assert.equal(lockDel.status, 409);
+
+  erin.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

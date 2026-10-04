@@ -17,6 +17,7 @@ async function setupTest() {
     ('user-bob','tenant-acme','Bob'),
     ('user-carol','tenant-acme','Carol'),
     ('user-owner','tenant-acme','Owner'),
+    ('user-erin','tenant-acme','Erin'),
     ('user-dave','tenant-globex','Dave'),
     ('user-nobody','tenant-acme','Nobody')`);
   await db.query(`INSERT INTO documents (id,tenant_id,title) VALUES

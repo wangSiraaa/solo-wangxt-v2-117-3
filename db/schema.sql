@@ -23,14 +23,24 @@ CREATE TABLE IF NOT EXISTS documents (
 
 -- Permission is checked on EVERY connection and EVERY update; the room/doc
 -- id is never trusted from the client without re-resolution against the db.
+-- changed_at/changed_by record the last management action (invite, role
+-- change, revoke) and its operator; seed rows keep changed_by = NULL.
 CREATE TABLE IF NOT EXISTS document_members (
     doc_id      TEXT NOT NULL REFERENCES documents(id),
     user_id     TEXT NOT NULL REFERENCES users(id),
     role        TEXT NOT NULL CHECK (role IN ('reader','writer','owner')),
     granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    changed_by  TEXT,
     revoked_at  TIMESTAMPTZ,
     PRIMARY KEY (doc_id, user_id)
 );
+
+-- Migrate databases created before member management existed.
+ALTER TABLE document_members
+    ADD COLUMN IF NOT EXISTS changed_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE document_members
+    ADD COLUMN IF NOT EXISTS changed_by TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_members_user ON document_members(user_id);
 

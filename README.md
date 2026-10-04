@@ -7,7 +7,8 @@ HTTP/WebSocket，PostgreSQL 保存只增的更新日志与压缩快照。不存�
 哈希**断言一致，而不是只看渲染出的字符串。
 
 无前端。`scripts/client-a.js` / `scripts/client-b.js` 是两个脚本客户端，用于
-演示并发编辑、乱序、删除与重连。
+演示并发编辑、乱序、删除与重连；`scripts/demo-members.js` 演示 owner 在运行期
+邀请协作者、调整角色与撤销（角色变化对旧连接的下一条写入立即生效）。
 
 ---
 
@@ -96,7 +97,35 @@ error_code / error_message`。区分 `BAD_JSON`、`BAD_ENVELOPE`、`BAD_ENCODING
 * **每次更新**都重新查库校验 `(user, doc)` 成员关系与角色，不使用连接期缓存：
   会话中途被撤销的成员，下一条 update 立即 `FORBIDDEN`（T8）。
 * `reader` 可连接/同步，但写帧返回 `READ_ONLY`。
-* HTTP 管理端点（压缩、恢复探测）执行同一套租户/角色校验。
+* HTTP 管理端点（压缩、恢复探测、成员管理）执行同一套租户/角色校验。
+* 成员关系可由 owner 在运行期通过 HTTP 管理（邀请/改角色/撤销），见下节；
+  因为写路径逐次查库，角色变化与撤销对**已建立连接的下一条 update** 立即生效。
+
+### 成员管理（owner 运行时管理协作者）
+
+成员关系不再只能由种子脚本写入。以下 HTTP 端点仅 **owner** 可用，调用者
+身份与 owner 角色在**每次请求**重新查库判定（被降职/撤销的 owner 立即失去
+管理权）。所有变更在 `document_members` 上记录 `changed_at` / `changed_by`，
+列表同时返回当前角色与撤销状态：
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /v1/docs/:docId/members` | 列出全部成员（含已撤销），含 `role / revoked / changedAt / changedBy` |
+| `POST /v1/docs/:docId/members` | 邀请同租户用户 `{userId, role}`（reader/writer）；已撤销成员被重新邀请时复活 |
+| `PATCH /v1/docs/:docId/members/:userId` | 调整活跃成员角色 `{role}`（reader ↔ writer） |
+| `DELETE /v1/docs/:docId/members/:userId` | 撤销成员（置 `revoked_at`） |
+
+约束：只能邀请与文档**同租户**的用户（跨租户 `TENANT_MISMATCH`）；只能授予
+`reader`/`writer`（负责人交接不在范围内）；owner 行不可被改角色或撤销
+（`OWNER_LOCKED`）。非 owner / 跨租户调用一律 `403` 且不落任何记录（T11）。
+
+角色变更对**已建立连接**的下一次写入立即生效：写路径本来就逐次查库，因此
+writer→reader 后旧连接再写得到 `READ_ONLY`，撤销后旧连接再写得到
+`FORBIDDEN`、重新连接在 hello 即被拒。
+
+```bash
+npm run demo:members   # 演示：邀请 writer → 协作 → 降 reader → 撤销 的完整流程
+```
 
 ---
 
@@ -166,6 +195,7 @@ curl -s -H 'x-auth-token: user-owner' \
 | user-owner | tenant-acme | owner |
 | user-alice / user-bob | tenant-acme | writer |
 | user-carol | tenant-acme | reader |
+| user-erin | tenant-acme | 无成员关系（供 `demo:members` 邀请演示） |
 | user-dave | tenant-globex | 另一个租户（跨租户访问应被拒绝） |
 
 ---
@@ -191,6 +221,7 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | owner 运行时管理成员：邀请 writer 可协作、降 reader 后旧连接写入 `READ_ONLY`、撤销后旧连接写入与重连均 `FORBIDDEN`；非 owner/跨租户调用管理端点不改变成员记录；列表返回角色、撤销状态与操作者 |
 
 ---
 
@@ -200,17 +231,18 @@ npm test
 db/schema.sql            表结构
 src/config.js            环境配置
 src/db.js                pg 连接池
-src/permissions.js       token 解析 + 每次连接/更新的成员与租户校验
+src/permissions.js       token 解析 + 每次连接/更新的成员与租户校验 + 成员管理读写
 src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
-src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
+src/server.js            Fastify 入口 + 成员管理/压缩/恢复 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
+scripts/demo-members.js  owner 成员管理演示（邀请/降职/撤销，角色变化即时生效）
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```
