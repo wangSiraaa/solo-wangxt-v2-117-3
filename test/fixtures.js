@@ -16,6 +16,7 @@ async function setupTest() {
     ('user-alice','tenant-acme','Alice'),
     ('user-bob','tenant-acme','Bob'),
     ('user-carol','tenant-acme','Carol'),
+    ('user-erin','tenant-acme','Erin'),
     ('user-owner','tenant-acme','Owner'),
     ('user-dave','tenant-globex','Dave'),
     ('user-nobody','tenant-acme','Nobody')`);

@@ -10,6 +10,7 @@
     "seed:reset": "node scripts/seed.js --reset",
     "demo:a": "node scripts/client-a.js",
     "demo:b": "node scripts/client-b.js",
+    "demo:members": "node scripts/client-members.js",
     "test": "node test/run-tests.js"
   },
   "keywords": [

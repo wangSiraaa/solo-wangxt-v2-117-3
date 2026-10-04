@@ -200,7 +200,13 @@ async function handleSyncReq(socket, room, ctx, frame) {
 }
 
 async function handleCompact(socket, room, ctx, frame) {
-  if (ctx.role === 'reader') {
+  // Same per-call database authorization as updates: a member demoted to
+  // reader (or revoked) mid-session must be refused on the next frame.
+  const role = await getActiveRole(ctx.userId, room.docId);
+  if (!role || role.tenant_id !== ctx.tenantId) {
+    return safeSend(socket, { type: 'error', code: 'FORBIDDEN', message: 'access revoked' });
+  }
+  if (role.role === 'reader') {
     return safeSend(socket, { type: 'error', code: 'READ_ONLY', message: 'reader cannot compact' });
   }
   const out = await compact(room, {

@@ -27,6 +27,7 @@ async function seed({ reset = false } = {}) {
     ['user-alice', 'tenant-acme', 'Alice'],
     ['user-bob', 'tenant-acme', 'Bob'],
     ['user-carol', 'tenant-acme', 'Carol (reader)'],
+    ['user-erin', 'tenant-acme', 'Erin (no membership yet, invite via API)'],
     ['user-dave', 'tenant-globex', 'Dave (other tenant)'],
     ['user-owner', 'tenant-acme', 'Owner'],
   ]) {

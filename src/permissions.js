@@ -47,12 +47,4 @@ async function listActiveDocs(userId) {
   return rows;
 }
 
-async function revokeMember(docId, userId) {
-  await db.query(
-    `UPDATE document_members SET revoked_at = now()
-      WHERE doc_id = $1 AND user_id = $2 AND revoked_at IS NULL`,
-    [docId, userId],
-  );
-}
-
-module.exports = { resolveToken, getActiveRole, listActiveDocs, revokeMember };
+module.exports = { resolveToken, getActiveRole, listActiveDocs };

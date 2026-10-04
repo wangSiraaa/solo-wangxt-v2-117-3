@@ -94,9 +94,38 @@ error_code / error_message`。区分 `BAD_JSON`、`BAD_ENVELOPE`、`BAD_ENCODING
 * hello 之后的帧不再携带房间号——连接已绑定到鉴权后的 room，客户端无法在帧里
   声称另一个房间。
 * **每次更新**都重新查库校验 `(user, doc)` 成员关系与角色，不使用连接期缓存：
-  会话中途被撤销的成员，下一条 update 立即 `FORBIDDEN`（T8）。
+  会话中途被撤销/降级的成员，下一条 update 立即得到 `FORBIDDEN`/`READ_ONLY`
+  （T8、T11）。
 * `reader` 可连接/同步，但写帧返回 `READ_ONLY`。
-* HTTP 管理端点（压缩、恢复探测）执行同一套租户/角色校验。
+* HTTP 管理端点（成员管理、压缩、恢复探测）执行同一套租户/角色校验。
+
+### 运行期成员管理（owner 接口）
+
+成员角色不再只能靠种子脚本写入：网关运行期间，文档 **owner** 可通过 HTTP 管理
+协作者。所有接口都在 `x-auth-token` 上做“解析 token → 校验该文档的活动 owner
+成员关系 → 同租户”三重检查；跨租户用户或非 owner（含 reader、writer、非成员、
+未知 token）的调用一律拒绝，且**不改变任何成员记录**（T11）。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/v1/docs/:docId/members` | 列出**全部**成员（含已撤销），返回当前角色、`active`、`revokedAt`、`grantedAt`、`updatedAt`、`updatedBy` |
+| POST | `/v1/docs/:docId/members/invite` | body `{userId, role}` 邀请**同租户已存在**用户为 `reader`/`writer`；之前被撤销的同一行会被重新激活（响应 `reactivated:true`） |
+| POST | `/v1/docs/:docId/members/:userId/role` | body `{role}` 在 `reader`/`writer` 之间调整角色 |
+| DELETE | `/v1/docs/:docId/members/:userId` | 撤销成员（置 `revoked_at`，行保留） |
+
+每次变更都在同一事务内写 `updated_at = now()` 与 `updated_by = 操作者`，并对
+文档行加 `FOR UPDATE` 锁串行化并发管理操作。边界约定：
+
+* 不提供临时授权，也不提供负责人交接：owner 行不能被降级或撤销（`OWNER_PROTECTED`
+  409），邀请/改角色只接受 `reader`/`writer`（`BAD_ROLE` 400）。
+* 已撤销行重新邀请是“复活”同一 `(doc_id,user_id)` 主键，`granted_at` 保留，
+  `revoked_at` 清空。
+* 典型错误码：`BAD_TOKEN`(401)、`FORBIDDEN`/`NOT_OWNER`/`CROSS_TENANT`(403)、
+  `NOT_MEMBER`/`NO_SUCH_USER`(404)、`ALREADY_MEMBER`/`ROLE_UNCHANGED`/
+  `MEMBER_REVOKED`/`ALREADY_REVOKED`/`OWNER_PROTECTED`(409)。
+* 因为写路径逐次查库，角色变化对**旧连接的下一次写入**立即生效，无需重连；
+  撤销后旧连接写入得到 `FORBIDDEN`，新连接的 hello 直接被拒。
+* `compact` 帧与 update 一样逐次重新查库鉴权，降级/撤销后的旧连接不能再压缩。
 
 ---
 
@@ -159,6 +188,17 @@ curl -s -H 'x-auth-token: user-owner' \
   http://127.0.0.1:7777/v1/docs/doc-demo/recovered-state
 ```
 
+运行期成员管理演示（owner 邀请 → 协作 → 降级 → 恢复 → 撤销 → 越权尝试）：
+
+```bash
+npm run seed:reset
+npm run demo:members
+# 脚本只用 HTTP 管理接口 + WebSocket 写路径，逐条打印 PASS/FAIL：
+#   邀请 writer 可协作；reader 后旧连接下一次写得到 READ_ONLY；
+#   撤销后旧连接写 FORBIDDEN、新连接 hello 被拒；
+#   reader/writer/跨租户用户调用管理接口均被拒且不改变记录。
+```
+
 种子身份（demo 用，用户 id 即 bearer token）：
 
 | 用户 | 租户 | 对 doc-demo 的角色 |
@@ -166,6 +206,7 @@ curl -s -H 'x-auth-token: user-owner' \
 | user-owner | tenant-acme | owner |
 | user-alice / user-bob | tenant-acme | writer |
 | user-carol | tenant-acme | reader |
+| user-erin | tenant-acme | 初始**无成员关系**，供邀请接口演示 |
 | user-dave | tenant-globex | 另一个租户（跨租户访问应被拒绝） |
 
 ---
@@ -191,6 +232,7 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | owner 列表/邀请同租户用户/reader↔writer 改角色/撤销：邀请后可协作；降级后**旧连接**下一次写 READ_ONLY，恢复后同一连接立即可写；撤销后旧连接写 FORBIDDEN 且新连接 hello 被拒；跨租户与非 owner 的管理调用全部 401/403 且不改变任何记录；owner 不可被降级/撤销 |
 
 ---
 
@@ -201,16 +243,18 @@ db/schema.sql            表结构
 src/config.js            环境配置
 src/db.js                pg 连接池
 src/permissions.js       token 解析 + 每次连接/更新的成员与租户校验
+src/members.js           owner 运行期成员管理（列表/邀请/改角色/撤销，含审计与事务）
 src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
-src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
+src/server.js            Fastify 入口 + 成员管理/压缩/恢复 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
+scripts/client-members.js 成员管理生命周期演示（邀请/改角色/撤销/越权）
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```

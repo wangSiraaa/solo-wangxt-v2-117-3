@@ -29,10 +29,21 @@ CREATE TABLE IF NOT EXISTS document_members (
     role        TEXT NOT NULL CHECK (role IN ('reader','writer','owner')),
     granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at  TIMESTAMPTZ,
+    -- Audit of the last membership change made through the management API
+    -- (invite / role change / revoke). updated_by is the operator's user id;
+    -- seed-written rows leave it NULL.
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by  TEXT REFERENCES users(id),
     PRIMARY KEY (doc_id, user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_members_user ON document_members(user_id);
+
+-- Migrations for databases created before runtime member management.
+ALTER TABLE document_members
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE document_members
+    ADD COLUMN IF NOT EXISTS updated_by TEXT REFERENCES users(id);
 
 -- Append-only Yjs update log.
 --   (doc_id, seq)        canonical replay / catch-up order

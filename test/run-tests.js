@@ -104,22 +104,24 @@ function httpGet(p, token) {
 }
 
 function httpPost(p, token, body) {
+  return httpCall('POST', p, token, body);
+}
+
+function httpCall(method, p, token, body) {
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body || {});
-    const req = http.request(`${BASE}${p}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-auth-token': token,
-        'content-length': Buffer.byteLength(data),
-      },
-    }, (res) => {
+    const data = body != null ? JSON.stringify(body) : null;
+    const headers = token ? { 'x-auth-token': token } : {};
+    if (data != null) {
+      headers['content-type'] = 'application/json';
+      headers['content-length'] = Buffer.byteLength(data);
+    }
+    const req = http.request(`${BASE}${p}`, { method, headers }, (res) => {
       let b = '';
       res.on('data', (d) => { b += d; });
       res.on('end', () => resolve({ status: res.statusCode, body: b }));
     });
     req.on('error', reject);
-    req.write(data);
+    if (data != null) req.write(data);
     req.end();
   });
 }
@@ -690,13 +692,188 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 runtime member management: invite, role change, revoke, immediate effect
+// ---------------------------------------------------------------------------
+const t11 = test('T11 owner manages members at runtime; role/revoke apply to old connections immediately', async () => {
+  await createDoc('t11', { writers: ['user-alice', 'user-bob'], readers: ['user-carol'], owners: ['user-owner'] });
+  const membersPath = '/v1/docs/t11/members';
+  const j = (res) => JSON.parse(res.body);
+
+  const api = (method, path, token, body) => httpCall(method, path, token, body);
+  const invite = (token, userId, role) =>
+    api('POST', `${membersPath}/invite`, token, { userId, role });
+  const setRole = (token, userId, role) =>
+    api('POST', `${membersPath}/${userId}/role`, token, { role });
+  const revoke = (token, userId) =>
+    api('DELETE', `${membersPath}/${userId}`, token);
+
+  const expectDeniedProbe = async (client, code, tag) => {
+    await assert.rejects(client.probeWrite(tag, 3000), new RegExp(code));
+  };
+
+  // Seed list: 4 members, audit columns present even on seed rows.
+  let res = await api('GET', membersPath, 'user-owner');
+  assert.equal(res.status, 200);
+  let list = j(res).members;
+  assert.equal(list.length, 4);
+  assert.deepEqual(list.map((m) => m.userId).sort(),
+    ['user-alice', 'user-bob', 'user-carol', 'user-owner']);
+  assert.ok(list.every((m) => m.active === true && m.role && m.updatedAt),
+    'list shows current role and update timestamp');
+  assert.equal(list.find((m) => m.userId === 'user-owner').updatedBy, null,
+    'seed-written row has no operator');
+
+  // Invite a same-tenant non-member as writer.
+  res = await invite('user-owner', 'user-erin', 'writer');
+  assert.equal(res.status, 201, res.body);
+  const invited = j(res);
+  assert.equal(invited.invited, true);
+  assert.equal(invited.member.role, 'writer');
+  assert.equal(invited.member.active, true);
+  assert.equal(invited.member.updatedBy, 'user-owner');
+  assert.ok(invited.member.updatedAt);
+  assert.equal(invited.member.revokedAt, null);
+
+  // The invited writer connects and collaborates.
+  const erin = new DocClient({ url: WS_URL, token: 'user-erin', docId: 't11' });
+  await erin.connect();
+  assert.equal(erin.role, 'writer');
+  erin.localEdit((t) => t.insert(t.length, 'erin-writer-1;'));
+  await erin.flush();
+
+  // Demote writer -> reader: the SAME connection that hello'd as writer gets
+  // READ_ONLY on its next write (authorization is re-queried per update).
+  res = await setRole('user-owner', 'user-erin', 'reader');
+  assert.equal(res.status, 200, res.body);
+  assert.equal(j(res).member.role, 'reader');
+  assert.equal(j(res).member.updatedBy, 'user-owner');
+
+  // The probe update is generated in a throwaway Yjs client identity so the
+  // refused bytes never touch erin's own local doc state.
+  await expectDeniedProbe(erin, 'READ_ONLY', 'erin-as-reader');
+
+  // promote again: erin's original connection immediately writes (auth is
+  // re-queried per update in both directions).
+  res = await setRole('user-owner', 'user-erin', 'writer');
+  assert.equal(res.status, 200);
+  erin.localEdit((t) => t.insert(t.length, 'erin-writer-2;'));
+  await erin.flush();
+
+  // Revoke: the same old connection's next write is forbidden immediately,
+  // no reconnect required; a new connection is refused at hello.
+  res = await revoke('user-owner', 'user-erin');
+  assert.equal(res.status, 200, res.body);
+  const revoked = j(res);
+  assert.equal(revoked.member.active, false);
+  assert.ok(revoked.member.revokedAt);
+  assert.equal(revoked.member.updatedBy, 'user-owner');
+
+  await expectDeniedProbe(erin, 'FORBIDDEN', 'erin-revoked');
+  erin.close();
+  await sleep(50);
+
+  // Denied edits never reached PostgreSQL: only the two accepted ones exist,
+  // and a cold replay contains exactly their text.
+  const goodSeqs = (await db.query(
+    `SELECT seq, octet_length(update_bytes) AS len FROM doc_updates
+      WHERE doc_id='t11' ORDER BY seq`,
+  )).rows;
+  assert.equal(goodSeqs.length, 2);
+
+  const erin2 = new DocClient({ url: WS_URL, token: 'user-erin', docId: 't11' });
+  await assert.rejects(erin2.connect(), /FORBIDDEN/);
+  try { erin2.hardClose(); } catch { /* hello rejected */ }
+
+  const rebuilt = await rebuildAndHash('t11');
+  assert.equal(rebuilt.text, 'erin-writer-1;erin-writer-2;');
+
+  // Re-invite (reactivation): same row reused, connect/write works again.
+  res = await invite('user-owner', 'user-erin', 'reader');
+  assert.equal(res.status, 201, res.body);
+  assert.equal(j(res).reactivated, true, 'previously revoked row is reactivated');
+  assert.equal(j(res).member.active, true);
+  assert.equal(j(res).member.role, 'reader');
+  const erin3 = new DocClient({ url: WS_URL, token: 'user-erin', docId: 't11' });
+  await erin3.connect();
+  assert.equal(erin3.role, 'reader');
+  erin3.close();
+
+  // --- Management surface authorization: no one but an owner may mutate ---
+  const before = (await db.query(
+    `SELECT user_id, role, revoked_at FROM document_members
+      WHERE doc_id='t11' ORDER BY user_id`,
+  )).rows;
+
+  // reader
+  assert.equal((await api('GET', membersPath, 'user-carol')).status, 403);
+  assert.equal((await invite('user-carol', 'user-nobody', 'writer')).status, 403);
+  // same-tenant non-member
+  assert.equal((await invite('user-nobody', 'user-alice', 'reader')).status, 403);
+  // writer (non-owner)
+  assert.equal((await setRole('user-alice', 'user-bob', 'reader')).status, 403);
+  assert.equal((await revoke('user-alice', 'user-bob')).status, 403);
+  // cross-tenant user with no membership here
+  assert.equal((await api('GET', membersPath, 'user-dave')).status, 403);
+  assert.equal((await invite('user-dave', 'user-bob', 'reader')).status, 403);
+  assert.equal((await revoke('user-dave', 'user-bob')).status, 403);
+  // unknown token
+  assert.equal((await api('GET', membersPath, 'no-such-user')).status, 401);
+  assert.equal((await revoke('no-such-user', 'user-bob')).status, 401);
+  // owner cannot pull a foreign-tenant user into the doc
+  const crossInvite = await invite('user-owner', 'user-dave', 'writer');
+  assert.equal(crossInvite.status, 403);
+  assert.equal(j(crossInvite).error, 'CROSS_TENANT');
+
+  // Owner protection and validation.
+  assert.equal(j(await setRole('user-owner', 'user-owner', 'reader')).error,
+    'OWNER_PROTECTED');
+  assert.equal((await setRole('user-owner', 'user-owner', 'reader')).status, 409);
+  assert.equal((await revoke('user-owner', 'user-owner')).status, 409);
+  assert.equal((await invite('user-owner', 'user-ghost', 'writer')).status, 404);
+  assert.equal(j(await invite('user-owner', 'user-erin', 'owner')).error,
+    'BAD_ROLE');
+  assert.equal((await invite('user-owner', 'user-erin', 'owner')).status, 400);
+  assert.equal((await setRole('user-owner', 'user-nobody', 'reader')).status, 404);
+
+  // None of the rejected calls changed any record.
+  const after = (await db.query(
+    `SELECT user_id, role, revoked_at FROM document_members
+      WHERE doc_id='t11' ORDER BY user_id`,
+  )).rows;
+  assert.deepEqual(after, before, 'denied management calls mutate nothing');
+
+  // Final list shows current role and revoked state, with operators.
+  res = await api('GET', membersPath, 'user-owner');
+  list = j(res).members;
+  const erinRow = list.find((m) => m.userId === 'user-erin');
+  assert.equal(erinRow.active, true);
+  assert.equal(erinRow.role, 'reader');
+  assert.equal(erinRow.updatedBy, 'user-owner');
+
+  // ws compact frame is also re-authorized per call (no connection cache).
+  res = await revoke('user-owner', 'user-erin');
+  assert.equal(res.status, 200);
+  const erin4 = new DocClient({ url: WS_URL, token: 'user-owner', docId: 't11' });
+  await erin4.connect();
+  await setRole('user-owner', 'user-alice', 'reader');
+  const alice = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  await alice.connect();
+  const errFrames = collect(alice, 'error');
+  alice.sendRaw(JSON.stringify({ type: 'compact' }));
+  const denied = await errFrames.wait((m) => m.code === 'READ_ONLY');
+  assert.equal(denied.code, 'READ_ONLY');
+  errFrames.stop();
+  alice.close(); erin4.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11];
   let pass = 0;
   const failures = [];
   for (const t of tests) {
